@@ -397,7 +397,7 @@ copy_or_fetch_script() {
     if [ -n "$installer" ] && [[ "$installer" != /dev/* ]] && [ -f "$installer" ]; then
         cp -- "$installer" "$target"
     else
-        fetch_url "https://raw.githubusercontent.com/edxgj/sing-box-sh/main/install.sh" "$target"
+        fetch_url "https://raw.githubusercontent.com/qingshous/sing-box-sh/main/install.sh" "$target"
     fi
 }
 fetch_script() {
