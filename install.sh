@@ -167,6 +167,39 @@ get_ip() {
     echo "$GLOBAL_IP"
 }
 
+# 获取公网 IPv4 (仅 v4, 无则空; 进程内缓存)
+get_ipv4() {
+    if [ -z "${_IPV4_CACHED+x}" ]; then
+        local ip
+        ip=$(curl -4 -fsSL --connect-timeout 5 --max-time 8 https://api.ipify.org 2>/dev/null) \
+            || ip=$(curl -4 -fsSL --connect-timeout 5 --max-time 8 https://4.ipw.cn 2>/dev/null) \
+            || ip=$(curl -4 -fsSL --connect-timeout 5 --max-time 8 https://ip.sb 2>/dev/null)
+        case "$ip" in
+            *[!0-9.]*) ip="" ;;
+        esac
+        _IPV4_PUB="$ip"
+        _IPV4_CACHED=1
+    fi
+    [ -n "$_IPV4_PUB" ] && echo "$_IPV4_PUB"
+}
+
+# 获取公网 IPv6 (仅 v6, 无则空; 进程内缓存)
+get_ipv6() {
+    if [ -z "${_IPV6_CACHED+x}" ]; then
+        local ip
+        ip=$(curl -6 -fsSL --connect-timeout 5 --max-time 8 https://api64.ipify.org 2>/dev/null) \
+            || ip=$(curl -6 -fsSL --connect-timeout 5 --max-time 8 https://6.ipw.cn 2>/dev/null) \
+            || ip=$(curl -6 -fsSL --connect-timeout 5 --max-time 8 https://ipv6.icanhazip.com 2>/dev/null)
+        case "$ip" in
+            *:*) : ;;
+            *) ip="" ;;
+        esac
+        _IPV6_PUB="$ip"
+        _IPV6_CACHED=1
+    fi
+    [ -n "$_IPV6_PUB" ] && echo "$_IPV6_PUB"
+}
+
 get_latest_version() {
     mkdir -p "$CONFIG_DIR" 2>/dev/null
     local CACHE_FILE="$CONFIG_DIR/.version_cache"
@@ -1416,6 +1449,59 @@ resolve_conn() {
     fi
 }
 
+# 按协议拼一条分享链接 (地址已由调用方定好)
+# 参数: $1=tag(含v4/v6后缀) $2=地址 $3=协议 $4=端口 $5=uuid $6=pass $7=sni $8=sid
+#       $9=is_reality $10=is_ws $11=ss_method $12=insecure $13=sni_url
+emit_link() {
+    local TAG=$1 ADDR=$2 TYPE=$3 PORT=$4 N_UUID=$5 N_PASS=$6 SNI=$7 SID=$8
+    local IS_REALITY=$9 IS_WS=${10} SS_METHOD=${11} INSECURE=${12} SNI_URL=${13}
+    local ADDR_URI
+    ADDR_URI=$(wrap_ipv6 "$ADDR")
+
+    case "$TYPE" in
+        vless)
+            if [ "$IS_REALITY" == "1" ]; then
+                local var_name="REALITY_PUB_${PORT}"
+                local PUB="${!var_name}"
+                printf '%s\n' "vless://${N_UUID}@${ADDR_URI}:${PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=chrome&pbk=${PUB}&sid=${SID}&type=tcp&headerType=none#${TAG}"
+            elif [ "$IS_WS" == "1" ]; then
+                local var_ip="ARGO_IP_${PORT}"
+                local var_dom="ARGO_DOMAIN_${PORT}"
+                local A_IP="${!var_ip}"
+                local A_DOM="${!var_dom}"
+                local A_IP_URI
+                A_IP_URI=$(wrap_ipv6 "$A_IP")
+                printf '%s\n' "vless://${N_UUID}@${A_IP_URI}:443?encryption=none&security=tls&type=ws&host=${A_DOM}&path=%2Fargo&sni=${A_DOM}#${TAG}"
+            fi
+            ;;
+        hysteria2)
+            local AUTH_ENC
+            AUTH_ENC=$(url_encode "$N_PASS")
+            printf '%s\n' "hysteria2://${AUTH_ENC}@${ADDR_URI}:${PORT}?security=tls&alpn=h3&insecure=${INSECURE}&allowInsecure=${INSECURE}${SNI_URL}#${TAG}"
+            ;;
+        tuic)
+            local T_UUID_ENC T_PASS_ENC
+            T_UUID_ENC=$(url_encode "$N_UUID")
+            T_PASS_ENC=$(url_encode "$N_PASS")
+            printf '%s\n' "tuic://${T_UUID_ENC}:${T_PASS_ENC}@${ADDR_URI}:${PORT}?congestion_control=bbr&udp_relay_mode=native&alpn=h3&insecure=${INSECURE}&allowInsecure=${INSECURE}${SNI_URL}#${TAG}"
+            ;;
+        anytls)
+            local AUTH_ENC
+            AUTH_ENC=$(url_encode "$N_PASS")
+            printf '%s\n' "anytls://${AUTH_ENC}@${ADDR_URI}:${PORT}?insecure=${INSECURE}&allowInsecure=${INSECURE}${SNI_URL}#${TAG}"
+            ;;
+        shadowsocks)
+            local SS_CRED
+            if [[ "$SS_METHOD" == 2022-* ]]; then
+                SS_CRED="$(url_encode "$SS_METHOD"):$(url_encode "$N_PASS")"
+            else
+                SS_CRED=$(printf '%s' "${SS_METHOD}:${N_PASS}" | base64 | tr -d '\n' | tr '+/' '-_' | tr -d '=')
+            fi
+            printf '%s\n' "ss://${SS_CRED}@${ADDR_URI}:${PORT}#${TAG}"
+            ;;
+    esac
+}
+
 build_share_url() {
     local TAG=$1
     local IP=$2
@@ -1431,60 +1517,40 @@ build_share_url() {
     resolve_conn "$CERT_PATH" "$IP"
     local SNI_URL="${CONN_SNI:+&sni=${CONN_SNI}}"
 
-    local IP_URI
-    IP_URI=$(wrap_ipv6 "$IP")
-    local CONN_ADDR_URI
-    CONN_ADDR_URI=$(wrap_ipv6 "$CONN_ADDR")
+    # REALITY / 直连 IP 类: 按 v4/v6 各出一条; 域名类 / Argo: 只出一条
+    if [ "$IS_REALITY" == "1" ]; then
+        # VLESS-REALITY: 地址即公网 IP
+        local v4 v6
+        v4=$(get_ipv4)
+        v6=$(get_ipv6)
+        if [ -n "$v4" ]; then emit_link "${TAG}-v4" "$v4" "$TYPE" "$PORT" "$N_UUID" "$N_PASS" "$SNI" "$SID" "$IS_REALITY" "$IS_WS" "$SS_METHOD" "$CONN_INSECURE" "$SNI_URL"; fi
+        if [ -n "$v6" ]; then emit_link "${TAG}-v6" "$v6" "$TYPE" "$PORT" "$N_UUID" "$N_PASS" "$SNI" "$SID" "$IS_REALITY" "$IS_WS" "$SS_METHOD" "$CONN_INSECURE" "$SNI_URL"; fi
+        if [ -z "$v4" ] && [ -z "$v6" ]; then echo -e "${RED}[错误] [获取公网IP异常，无法生成 VLESS-REALITY 链接]${PLAIN}"; fi
+        return
+    fi
 
-    case "$TYPE" in
-        vless)
-            if [ "$IS_REALITY" == "1" ]; then
-                if [ -z "$IP" ]; then echo -e "${RED}[错误] [获取公网IP异常，无法生成 VLESS-REALITY 链接]${PLAIN}"; return; fi
-                local var_name="REALITY_PUB_${PORT}"
-                local PUB="${!var_name}"
-                printf '%s\n' "vless://${N_UUID}@${IP_URI}:${PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=chrome&pbk=${PUB}&sid=${SID}&type=tcp&headerType=none#${TAG}"
-            elif [ "$IS_WS" == "1" ]; then
-                local var_ip="ARGO_IP_${PORT}"
-                local var_dom="ARGO_DOMAIN_${PORT}"
-                local A_IP="${!var_ip}"
-                local A_DOM="${!var_dom}"
-                if [ -z "$A_IP" ]; then echo -e "${RED}[错误] [无法读取 Argo IP，无法生成链接]${PLAIN}"; return; fi
-                local A_IP_URI
-                A_IP_URI=$(wrap_ipv6 "$A_IP")
-                printf '%s\n' "vless://${N_UUID}@${A_IP_URI}:443?encryption=none&security=tls&type=ws&host=${A_DOM}&path=%2Fargo&sni=${A_DOM}#${TAG}"
-            fi
-            ;;
-        hysteria2)
-            if [ -z "$CONN_ADDR" ]; then echo -e "${RED}[错误] [获取连接地址失败，无法生成 Hysteria2 链接]${PLAIN}"; return; fi
-            local AUTH_ENC
-            AUTH_ENC=$(url_encode "$N_PASS")
-            printf '%s\n' "hysteria2://${AUTH_ENC}@${CONN_ADDR_URI}:${PORT}?security=tls&alpn=h3&insecure=${CONN_INSECURE}&allowInsecure=${CONN_INSECURE}${SNI_URL}#${TAG}"
-            ;;
-        tuic)
-            if [ -z "$CONN_ADDR" ]; then echo -e "${RED}[错误] [获取连接地址失败，无法生成 TUIC 链接]${PLAIN}"; return; fi
-            local T_UUID_ENC
-            T_UUID_ENC=$(url_encode "$N_UUID")
-            local T_PASS_ENC
-            T_PASS_ENC=$(url_encode "$N_PASS")
-            printf '%s\n' "tuic://${T_UUID_ENC}:${T_PASS_ENC}@${CONN_ADDR_URI}:${PORT}?congestion_control=bbr&udp_relay_mode=native&alpn=h3&insecure=${CONN_INSECURE}&allowInsecure=${CONN_INSECURE}${SNI_URL}#${TAG}"
-            ;;
-        anytls)
-            if [ -z "$CONN_ADDR" ]; then echo -e "${RED}[错误] [获取连接地址失败，无法生成 AnyTLS 链接]${PLAIN}"; return; fi
-            local AUTH_ENC
-            AUTH_ENC=$(url_encode "$N_PASS")
-            printf '%s\n' "anytls://${AUTH_ENC}@${CONN_ADDR_URI}:${PORT}?insecure=${CONN_INSECURE}&allowInsecure=${CONN_INSECURE}${SNI_URL}#${TAG}"
-            ;;
-        shadowsocks)
-            if [ -z "$CONN_ADDR" ]; then echo -e "${RED}[错误] [获取连接地址失败，无法生成 Shadowsocks 链接]${PLAIN}"; return; fi
-            local SS_CRED
-            if [[ "$SS_METHOD" == 2022-* ]]; then
-                SS_CRED="$(url_encode "$SS_METHOD"):$(url_encode "$N_PASS")"
-            else
-                SS_CRED=$(printf '%s' "${SS_METHOD}:${N_PASS}" | base64 | tr -d '\n' | tr '+/' '-_' | tr -d '=')
-            fi
-            printf '%s\n' "ss://${SS_CRED}@${CONN_ADDR_URI}:${PORT}#${TAG}"
-            ;;
-    esac
+    if [ "$IS_WS" == "1" ]; then
+        # Argo: 走 Cloudflare 隧道, 地址固定, 单条
+        local var_ip="ARGO_IP_${PORT}"
+        if [ -z "${!var_ip}" ]; then echo -e "${RED}[错误] [无法读取 Argo IP，无法生成链接]${PLAIN}"; return; fi
+        emit_link "$TAG" "$IP" "$TYPE" "$PORT" "$N_UUID" "$N_PASS" "$SNI" "$SID" "$IS_REALITY" "$IS_WS" "$SS_METHOD" "$CONN_INSECURE" "$SNI_URL"
+        return
+    fi
+
+    # hysteria2/tuic/anytls/ss: 地址可能是域名或 IP
+    if [ -z "$CONN_ADDR" ]; then echo -e "${RED}[错误] [获取连接地址失败，无法生成链接]${PLAIN}"; return; fi
+    if [[ "$CONN_ADDR" == *":"* ]] || [[ "$CONN_ADDR" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        # 纯 IP 直连: 按 v4/v6 各出一条
+        local v4 v6
+        v4=$(get_ipv4)
+        v6=$(get_ipv6)
+        if [ -n "$v4" ]; then emit_link "${TAG}-v4" "$v4" "$TYPE" "$PORT" "$N_UUID" "$N_PASS" "$SNI" "$SID" "$IS_REALITY" "$IS_WS" "$SS_METHOD" "$CONN_INSECURE" "$SNI_URL"; fi
+        if [ -n "$v6" ]; then emit_link "${TAG}-v6" "$v6" "$TYPE" "$PORT" "$N_UUID" "$N_PASS" "$SNI" "$SID" "$IS_REALITY" "$IS_WS" "$SS_METHOD" "$CONN_INSECURE" "$SNI_URL"; fi
+        if [ -z "$v4" ] && [ -z "$v6" ]; then echo -e "${RED}[错误] [获取公网IP异常，无法生成链接]${PLAIN}"; fi
+    else
+        # 域名: 单条
+        emit_link "$TAG" "$CONN_ADDR" "$TYPE" "$PORT" "$N_UUID" "$N_PASS" "$SNI" "$SID" "$IS_REALITY" "$IS_WS" "$SS_METHOD" "$CONN_INSECURE" "$SNI_URL"
+    fi
 }
 
 print_config_detail() {
@@ -1513,9 +1579,13 @@ print_config_detail() {
             if [ "$IS_REALITY" == "1" ]; then
                 local var_name="REALITY_PUB_${PORT}"
                 local PUB="${!var_name}"
-                local IP_DISP
+                local IP_DISP V4_DISP V6_DISP
                 IP_DISP=$(wrap_ipv6 "$IP")
+                V4_DISP=$(get_ipv4); [ -z "$V4_DISP" ] && V4_DISP="无 IPv4"
+                V6_DISP=$(get_ipv6); [ -z "$V6_DISP" ] && V6_DISP="无 IPv6"
                 echo -e "地址 (address)\t\t\t= ${IP_DISP:-[获取公网IP失败]}"
+                echo -e "IPv4 地址 (v4)\t\t\t= $V4_DISP"
+                echo -e "IPv6 地址 (v6)\t\t\t= $V6_DISP"
                 echo -e "端口 (port)\t\t\t= $PORT"
                 echo -e "用户ID (id)\t\t\t= $N_UUID"
                 echo -e "流控 (flow)\t\t\t= xtls-rprx-vision"
