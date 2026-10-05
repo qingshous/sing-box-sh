@@ -186,14 +186,32 @@ get_ipv4() {
 # 获取公网 IPv6 (仅 v6, 无则空; 进程内缓存)
 get_ipv6() {
     if [ -z "${_IPV6_CACHED+x}" ]; then
-        local ip
-        ip=$(curl -6 -fsSL --connect-timeout 5 --max-time 8 https://api64.ipify.org 2>/dev/null) \
-            || ip=$(curl -6 -fsSL --connect-timeout 5 --max-time 8 https://6.ipw.cn 2>/dev/null) \
-            || ip=$(curl -6 -fsSL --connect-timeout 5 --max-time 8 https://ipv6.icanhazip.com 2>/dev/null)
-        case "$ip" in
-            *:*) : ;;
-            *) ip="" ;;
-        esac
+        local ip=""
+        local line addr
+        # 探测本机网卡上的公网 v6 段 (2000:~3fff:), 而非 curl 出口地址 (NAT66 上游地址不可入站)
+        if command -v ip >/dev/null 2>&1; then
+            while read -r line; do
+                addr=$(printf '%s\n' "$line" | sed -n 's/.*inet6 \([0-9a-fA-F:]*\)\/.*/\1/p')
+                [ -z "$addr" ] && continue
+                case "$addr" in
+                    ::1|fe80:*|fd*|fc*) continue ;;
+                esac
+                case "$addr" in
+                    2[0-9a-fA-F]*|3[0-9a-fA-F]*) ip="$addr"; break ;;
+                esac
+            done < <(ip -6 addr show 2>/dev/null)
+        elif command -v ifconfig >/dev/null 2>&1; then
+            while read -r line; do
+                addr=$(printf '%s\n' "$line" | sed -n 's/.*inet6 addr: *\([0-9a-fA-F:]*\)\/.*/\1/p')
+                [ -z "$addr" ] && continue
+                case "$addr" in
+                    ::1|fe80:*|fd*|fc*) continue ;;
+                esac
+                case "$addr" in
+                    2[0-9a-fA-F]*|3[0-9a-fA-F]*) ip="$addr"; break ;;
+                esac
+            done < <(ifconfig 2>/dev/null)
+        fi
         _IPV6_PUB="$ip"
         _IPV6_CACHED=1
     fi
