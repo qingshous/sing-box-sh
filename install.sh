@@ -912,16 +912,25 @@ restart_service() {
     if ! /usr/local/bin/sing-box check -c $CONFIG_FILE; then return 1; fi
     
     if [ "$OS_TYPE" == "alpine" ]; then
+        # 若已存在旧版无守护的服务文件(command_background 无自愈), 强制重写为 supervise-daemon 版
+        if [ -e "/etc/init.d/sing-box" ] || [ -L "/etc/init.d/sing-box" ]; then
+            if ! grep -q 'supervise-daemon' "/etc/init.d/sing-box" 2>/dev/null; then
+                rm -f "/etc/init.d/sing-box"
+            fi
+        fi
         if [ ! -e "/etc/init.d/sing-box" ] && [ ! -L "/etc/init.d/sing-box" ]; then
             service_tmp=$(mktemp "/etc/init.d/sing-box.tmp.XXXXXX") || return 1
             SB_OWNED_TEMP_FILES+=("$service_tmp")
             if ! cat > "$service_tmp" << 'EOF'
 #!/sbin/openrc-run
 name="sing-box"
+supervisor=supervise-daemon
 command="/usr/local/bin/sing-box"
 command_args="run -c /etc/sing-box/config.json"
-command_background=true
-pidfile="/var/run/sing-box.pid"
+respawn_delay=10
+respawn_max=0
+supervise_daemon_args="--stdout /var/log/sing-box.out.log --stderr /var/log/sing-box.err.log"
+pidfile="/run/sing-box.pid"
 rc_ulimit="-n 65535"
 depend() { need net; }
 EOF
